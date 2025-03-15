@@ -1,0 +1,225 @@
+use bit_field::BitField;
+use embedded_can::{Frame, Id, StandardId};
+use heapless::Vec;
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+
+#[derive(PartialEq)]
+pub struct NodeId(u8);
+
+impl NodeId {
+    pub fn new(raw_id: u8) -> Option<Self> {
+        if raw_id & 0xF0 != 0 {
+            return None;
+        }
+        Some(Self(raw_id))
+    }
+    pub unsafe fn new_unchecked(raw_id: u8) -> Self {
+        Self(raw_id)
+    }
+    pub fn as_raw(&self) -> u8 {
+        self.0
+    }
+}
+
+/// Control Space: 0x00 - 0x1F
+/// Application Space: 0x20 - 0x5F
+/// Config Space: 0x60 - 0x7F
+#[derive(IntoPrimitive, TryFromPrimitive)]
+#[repr(u8)]
+pub enum DataType {
+    Stop = 0x00,
+    Ping = 0x01,
+    Pong = 0x02,
+    NotifySwitchState = 0x20,
+    SetMotorDuty = 0x21,
+    SetMotorRpm = 0x22,
+    NotifyMotorCurrentRpm = 0x23,
+    SetPGain = 0x60,
+    SetIGain = 0x61,
+    SetDGain = 0x62,
+    SetControlFreq = 0x63,
+}
+
+trait StandardIdFactory {
+    type Output;
+    fn parse(&self) -> Option<(NodeId, DataType)>;
+    fn build(sender_id: NodeId, data_type: DataType) -> Self::Output;
+}
+
+impl StandardIdFactory for StandardId {
+    type Output = StandardId;
+
+    fn parse(&self) -> Option<(NodeId, DataType)> {
+        let sender_id = unsafe { NodeId::new_unchecked((self.as_raw().get_bits(7..11)) as u8) };
+        let data_type = DataType::try_from(self.as_raw().get_bits(0..7) as u8).ok()?;
+        Some((sender_id, data_type))
+    }
+
+    fn build(sender_id: NodeId, data_type: DataType) -> Self::Output {
+        let raw: u16 = (sender_id.as_raw() as u16) << 7 | u8::from(data_type) as u16;
+        unsafe { StandardId::new_unchecked(raw) }
+    }
+}
+
+pub enum FrameData {
+    Stop,
+    Ping,
+    Pong,
+    NotifySwitchState(NotifySwitchState),
+    SetMotorDuty,
+    SetMotorRpm,
+    NotifyMotorCurrentRpm,
+    SetPGain,
+    SetIGain,
+    SetDGain,
+    SetControlFreq,
+}
+
+impl FrameData {
+    pub fn data_type(&self) -> DataType {
+        match self {
+            Self::Stop => DataType::Stop,
+            Self::Ping => DataType::Ping,
+            Self::Pong => DataType::Pong,
+            Self::NotifySwitchState(_) => DataType::NotifySwitchState,
+            Self::SetMotorDuty => DataType::SetMotorDuty,
+            Self::SetMotorRpm => DataType::SetMotorRpm,
+            Self::NotifyMotorCurrentRpm => DataType::NotifyMotorCurrentRpm,
+            Self::SetPGain => DataType::SetPGain,
+            Self::SetIGain => DataType::SetIGain,
+            Self::SetDGain => DataType::SetDGain,
+            Self::SetControlFreq => DataType::SetControlFreq,
+        }
+    }
+    pub fn into_vec(&self) -> Vec<u8, 7> {
+        match self {
+            Self::Stop => Vec::new(),
+            Self::Ping => Vec::new(),
+            Self::Pong => Vec::new(),
+            Self::NotifySwitchState(d) => Vec::from_slice(&d.into_array()).unwrap(),
+            Self::SetMotorDuty => Vec::new(),
+            Self::SetMotorRpm => Vec::new(),
+            Self::NotifyMotorCurrentRpm => Vec::new(),
+            Self::SetPGain => Vec::new(),
+            Self::SetIGain => Vec::new(),
+            Self::SetDGain => Vec::new(),
+            Self::SetControlFreq => Vec::new(),
+        }
+    }
+}
+
+pub struct NotifySwitchState {
+    channel: u8,
+    is_pushed: bool,
+}
+
+impl NotifySwitchState {
+    pub fn new(channel: u8, is_pushed: bool) -> Self {
+        Self { channel, is_pushed }
+    }
+    fn from_slice(slice: &[u8]) -> Option<Self> {
+        if slice.len() != 2 {
+            return None;
+        }
+
+        let is_pushed = match slice.get(1).unwrap() {
+            0 => false,
+            1 => true,
+            _ => {
+                return None;
+            }
+        };
+        Some(Self::new(*slice.get(0).unwrap(), is_pushed))
+    }
+    fn into_array<'a>(&'a self) -> [u8; 2] {
+        [self.channel, self.is_pushed as u8]
+    }
+
+    pub fn get_channel(&self) -> &u8 {
+        &self.channel
+    }
+
+    pub fn is_pushed(&self) -> bool {
+        self.is_pushed
+    }
+}
+
+pub struct MotorDuty {
+    channel: u8,
+    duty: u16,
+    dir: bool,
+}
+
+impl MotorDuty {
+    pub fn new(channel: u8, duty: u16, dir: bool) -> Self {
+        Self { channel, duty, dir }
+    }
+    fn from_slice(slice: &[u8]) -> Option<Self> {
+        if slice.len() != 4 {
+            return None;
+        }
+
+        let duty = (*slice.get(1).unwrap() << 8) as u16 | *slice.get(2).unwrap() as u16;
+
+        let dir = match slice.get(3).unwrap() {
+            0 => false,
+            1 => true,
+            _ => {
+                return None;
+            }
+        };
+        Some(Self::new(*slice.get(0).unwrap(), duty, dir))
+    }
+    fn into_array<'a>(&'a self) -> [u8; 4] {
+        let duty_bytes = self.duty.to_be_bytes();
+        [self.channel, duty_bytes[0], duty_bytes[1], self.dir as u8]
+    }
+}
+
+pub struct MotorRpm {
+    channel: u8,
+}
+
+pub fn parse_frame<F: Frame>(frame: F) -> Option<(NodeId, NodeId, FrameData)> {
+    if frame.is_remote_frame() {
+        return None;
+    }
+    match frame.id() {
+        Id::Standard(id) => {
+            let (sender_id, data_type) = id.parse()?;
+            let (receiver_raw_id, raw_data) = frame.data().split_first()?;
+            let receiver_id = NodeId::new(*receiver_raw_id)?;
+            let data = match data_type {
+                DataType::Stop => FrameData::Stop,
+                DataType::Ping => FrameData::Ping,
+                DataType::Pong => FrameData::Pong,
+                DataType::NotifySwitchState => {
+                    FrameData::NotifySwitchState(NotifySwitchState::from_slice(raw_data)?)
+                }
+                DataType::SetMotorDuty => FrameData::SetMotorDuty,
+                DataType::SetMotorRpm => FrameData::SetMotorRpm,
+                DataType::NotifyMotorCurrentRpm => FrameData::NotifyMotorCurrentRpm,
+                DataType::SetPGain => FrameData::SetPGain,
+                DataType::SetIGain => FrameData::SetIGain,
+                DataType::SetDGain => FrameData::SetDGain,
+                DataType::SetControlFreq => FrameData::SetControlFreq,
+            };
+            return Some((sender_id, receiver_id, data));
+        }
+        _ => return None,
+    }
+}
+
+pub fn build_frame(
+    sender_id: NodeId,
+    receiver_id: NodeId,
+    frame_data: FrameData,
+) -> (StandardId, Vec<u8, 8>) {
+    let id = StandardId::build(sender_id, frame_data.data_type());
+    let mut data = Vec::new();
+    data.push(receiver_id.as_raw()).unwrap();
+    for i in frame_data.into_vec() {
+        data.push(i).unwrap();
+    }
+    (id, data)
+}

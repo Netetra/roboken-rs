@@ -1,0 +1,11 @@
+[package]
+name = "roboken-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bit_field = "0.10.2"
+embedded-can = "0.4.1"
+heapless = "0.8.0"
+micromath = { version = "2.1.0", features = [ "vector" ] }
+num_enum = "0.7.3"
